@@ -4,10 +4,208 @@ output: html_notebook
 date: 2019-04-16
 ---
 
+```{r}
+library(tidyverse)
+library(caret)
+library(broom)
+```
+
+
 Load and inspect data
 
 ```{r}
-afds
+df_train <- read_csv("train.csv")
+str(df_train)
+sum(is.na(df_train))
+df_train_cov <- df_train %>% select(-id, -target)
 ```
 
+Data preprocessing
+
+```{r}
+nearZeroVar(df_train_cov, saveMetrics = T)
+findCorrelation(cor(df_train_cov), cutoff = 0.5)
+lin_combos <- findLinearCombos(as.matrix(df_train_cov))
+lin_combos$remove
+sum(is.na(df_train_cov))
+
+pre_proc <- preProcess(df_train_cov, method = c("center", "scale", "pca"))
+df_train_cov2 <- predict(pre_proc, df_train_cov)
+df_train2 <- bind_cols(select(df_train, target), df_train_cov2) %>% mutate(target = as.factor(target))
+```
+
+No problems with zero- and near zero- variance.
+No autocorrelation.
+Features 251-300 are linear combinations
+No missing values.
+Center, scale, reduce to principal components
+
+
+Train model using eXtreme Gradient Boosting - DART (Dropouts meet Multiple Additive Regression Trees)
+Use bootstrapping due to small sample size
+
+```{r}
+set.seed(1234)
+fit_control <- trainControl(method = "boot",
+                            number = 10)
+
+xgbfit1 <- train(target ~ .,
+                 data = df_train2,
+                 method = "xgbDART",
+                 trControl = fit_control)
+
+options(max.print = 10000)
+xgbfit1
+plot(xgbfit1)
+
+train_pred <- predict(xgbfit1, df_train2)
+table(train_pred,df_train$target)
+```
+The final values used for the model were nrounds = 150, max_depth = 3, eta = 0.3, gamma = 0, subsample = 0.75, colsample_bytree
+ = 0.6, rate_drop = 0.01, skip_drop = 0.05 and min_child_weight = 1.
+
+
+Tune parameters:
+max_depth (max depth of a tree) - increasing will make the model more complex and more likely to overfit
+eta (learning/shrinkage parameter) - bigger values result in more over-fitting problems
+colsample_bytree (subsample ratio of columns when constructing each tree) - <1 may result in models more robust to overfitting
+gamma -
+min_child_weight (the minimum number of observations (instances) in a terminal node)
+
+```{r}
+xgbgrid <- expand.grid(nrounds = c(50, 100, 150),
+                       max_depth = 1,
+                       eta = 0.05,
+                       gamma = c(1, 5, 10),
+                       subsample = c(0.5, 0.75),
+                       colsample_bytree = c(1/3, 2/3),
+                       rate_drop = 0.01,
+                       skip_drop = 0.05,
+                       min_child_weight = c(1, 5, 10)
+                       )
+```
+
+Fit model using these more conservative parameters
+
+```{r}
+xgbfit2 <- train(target ~ .,
+                 data = df_train2,
+                 method = "xgbDART",
+                 trControl = fit_control,
+                 tuneGrid = xgbgrid)
+xgbfit2
+plot(xgbfit2)
+```
+
+The final values used for the model were nrounds = 150, max_depth = 1, eta = 0.05, gamma = 1, subsample = 0.5, colsample_bytree
+ = 0.6666667, rate_drop = 0.01, skip_drop = 0.05 and min_child_weight = 10.
+
+
+Prepare test data
+
+```{r}
+df_test <- read_csv("test.csv")
+df_test2 <- select(df_test, -id)
+df_test2 <- predict(pre_proc, df_test2)
+```
+
+Fit model to test data
+
+```{r}
+predicted1 <- predict(xgbfit1, df_test2)
+predicted2 <- predict(xgbfit2, df_test2)
+```
+
+Save as CSV
+
+```{r}
+write_csv(data.frame(id = df_test$id, target = predicted1), "predicted1.csv")
+write_csv(data.frame(id = df_test$id, target = predicted2), "predicted2.csv")
+```
+
+Both submissions were very poor - need new strategy (no more pca, xgboost)
+
+
+Let's try logistic regression with lasso regularization
+
+```{r}
+library(glmnet)
+pre_proc2 <- preProcess(df_train_cov, method = c("center", "scale"))
+df_train_cov3 <- predict(pre_proc2, df_train_cov)
+x <- data.matrix(df_train_cov3)
+y <- as.factor(df_train$target)
+```
+
+Find the best lambda using CV
+
+```{r}
+set.seed(1234)
+cv_lasso <- cv.glmnet(x, y, family = "binomial")
+cv_lasso$lambda.1se
+coef(cv_lasso, cv_lasso$lambda.1se)
+```
+
+Using lambda.lse will be more conservative than using lambda.min
+
+```{r}
+mod_lasso <- glmnet(x, y, family = "binomial", lambda = cv_lasso$lambda.lse)
+```
+
+Prepare test data
+
+```{r}
+df_test <- read_csv("test.csv")
+df_test3 <- select(df_test, -id)
+df_test3 <- predict(pre_proc2, df_test3)
+x_test <- data.matrix(df_test3)
+```
+
+Make predicitons on test data
+
+```{r}
+prob <- predict(mod_lasso, newx = x_test, s = cv_lasso$lambda.1se, type = "response")
+predicted3 <- ifelse(prob > 0.5, 1, 0)
+write_csv(data.frame(id = df_test$id, target = as.vector(predicted3)), "predicted3.csv")
+```
+
+This was an improvement over the previous 2 predictions, but is still not great (acc = .662)
+
+
+Let's try using elastic net - blending of ridge and lasso regularization
+
+```{r}
+df_train4 <- df_train %>% 
+  select(target) %>% 
+  mutate(target = as.factor(target)) %>% 
+  bind_cols(df_train_cov3)
+
+set.seed(1234)
+
+fit_control <- trainControl(method = "cv",
+                            number = 10)
+
+glmgrid <- expand.grid(alpha = seq(0, 1, by = .1),
+                       lambda = seq(0, .1, by = .01)
+                       )
+
+glm_fit <- train(target ~ .,
+                 data = df_train4,
+                 method = "glmnet",
+                 trControl = fit_control,
+                 tuneGrid = glmgrid)
+```
+
+
+```{r}
+glm_fit
+```
+
+Best model uses alpha = 0.2 and lambda = 0.08 for a CV accuracy of .75
+
+```{r}
+predicted4 <- predict(glm_fit, df_test3)
+write_csv(data.frame(id = df_test$id, target = predicted4), "predicted4.csv")
+```
+
+This last model had a test accuracy of .697. At least it improved.
 
